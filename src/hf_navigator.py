@@ -89,7 +89,7 @@ def main():
         
         # Cabecera Informativa
         print("==========================================")
-        print(f"   🚀 HF NAVIGATOR PRO  |  RAM: {ram_sys:.1f}GB  VRAM: {vram_sys:.1f}GB")
+        print(f"   🚀 HF MODEL CHECKER  |  RAM: {ram_sys:.1f}GB  VRAM: {vram_sys:.1f}GB")
         if CACHE_READY:
             print(f"   💾 Caché Local: {len(LOCAL_CACHE_REPOS)} modelos detectados")
         else:
@@ -172,8 +172,22 @@ def main():
             
             elif selected:
                 # Ejecutar el Checker
-                # Pasamos la VRAM como argumento para no recalcularla en el hijo si no queremos
-                subprocess.run([sys.executable, "hf_model_checker.py", "--model", selected])
+                
+                # 1. Obtener la ruta absoluta donde vive ESTE script (hf_navigator.py)
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                
+                # 2. Construir la ruta completa al checker
+                checker_path = os.path.join(script_dir, "hf_model_checker.py")
+
+                # 3. Ejecutar usando la ruta absoluta
+                # Verificamos si existe por si acaso
+                if os.path.exists(checker_path):
+                    # Pasamos la VRAM como argumento para no recalcularla en el hijo si no queremos
+                    subprocess.run([sys.executable, checker_path, "--model", selected])
+                else:
+                    print(f"❌ Error: No encuentro {checker_path}")                
+
+
                 print("\n" + "-"*50)
                 questionary.press_any_key_to_continue().ask()
                 # Al volver, redibujamos la lista (break del submenu visual, no del loop principal)
