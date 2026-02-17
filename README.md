@@ -48,6 +48,7 @@ Permite buscar modelos y explorar el historial o categorías:
 python hf_navigator.py
 
 ```
+<img width="1438" height="483" alt="model-checker" src="https://github.com/user-attachments/assets/291410f6-27c6-4165-b140-b8003d89122f" />
 
 ### Análisis directo
 
