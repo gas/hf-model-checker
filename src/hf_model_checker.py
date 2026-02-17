@@ -1,329 +1,156 @@
-from typing import Dict, List, Tuple, Optional, Any, Union
-import json
-import os
-import sys
+import argparse
 import psutil
 import torch
-from huggingface_hub import HfApi
+import re
+from huggingface_hub import HfApi, scan_cache_dir
 from rich.console import Console
-from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
+from rich.panel import Panel
 
-console: Console = Console()
+console = Console()
 
-if not os.path.exists("quant_multipliers.json"):
-    console.print("[red]Error:[/red] quant_multipliers.json not found!")
-    console.print("Please ensure the file exists in the same directory as the script.")
-    sys.exit(1)
+# --- Funciones de Sistema ---
 
-with open("quant_multipliers.json", "r") as file:
-    QUANT_MULTIPLIERS: Dict[str, float] = json.load(file)
-
-
-def get_system_memory() -> Tuple[float, float]:
-    ram_gb: float = psutil.virtual_memory().total / (1024**3)
-    vram_gb: float = -1.0
+def get_system_memory():
+    ram = psutil.virtual_memory().total / (1024**3)
+    vram = 0
     if torch.cuda.is_available():
-        device: int = torch.cuda.current_device()
-        vram_gb = torch.cuda.get_device_properties(device).total_memory / (1024**3)
-    return ram_gb, vram_gb
+        vram = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    return ram, vram
 
-
-def get_best_quantization(
-    available_ram_gb: float,
-    available_vram_gb: float,
-    model_size_gb: float,
-    available_quants: List[str],
-) -> str:
-    max_memory: float = max(available_ram_gb, available_vram_gb)
-    filtered_quants: Dict[str, float] = {
-        k: v for k, v in QUANT_MULTIPLIERS.items() if k in available_quants
-    }
-    suitable_quants: List[str] = []
-    for quant, multiplier in filtered_quants.items():
-        required_memory: float = model_size_gb * (multiplier + 0.1)
-        if required_memory <= max_memory:
-            suitable_quants.append(quant)
-    return (
-        suitable_quants[-1]
-        if suitable_quants
-        else "Model too large for available memory"
-    )
-
-
-def estimate_ram_requirement(file_name: str, file_size_bytes: int) -> float:
-    size_gb: float = file_size_bytes / (1024**3)
-    file_upper: str = file_name.upper()
-    overhead_multiplier: float = 2.5
-
-    for quant, mult in QUANT_MULTIPLIERS.items():
-        if quant in file_upper:
-            overhead_multiplier = mult
-            break
-
-    base_ram: float = size_gb * overhead_multiplier
-    attention_overhead: float = size_gb * 0.1
-    return base_ram + attention_overhead
-
-
-def get_performance_label(
-    estimated_ram_needed: float, user_ram_gb: float, vram_gb: float = 0
-) -> str:
-    if vram_gb >= estimated_ram_needed:
-        return f"[green]GPU-Ready[/green] (needs {estimated_ram_needed:.2f}GB, {vram_gb:.2f}GB VRAM available)"
-
-    if estimated_ram_needed > user_ram_gb:
-        return f"[red]Too large[/red] (needs {estimated_ram_needed:.2f}GB, {user_ram_gb:.2f}GB RAM available)"
-    elif estimated_ram_needed > user_ram_gb * 0.5:
-        return f"[yellow]Will be slow[/yellow] (needs {estimated_ram_needed:.2f}GB, {user_ram_gb:.2f}GB RAM available)"
-    else:
-        return f"[green]Ready[/green] (needs {estimated_ram_needed:.2f}GB, {user_ram_gb:.2f}GB RAM available)"
-
-
-def group_split_files(
-    files: List[Any],
-) -> Dict[str, Dict[str, Union[float, List[Any]]]]:
-    grouped: Dict[str, Dict[str, Union[float, List[Any]]]] = {}
-    for f in files:
-        quant_type: Optional[str] = None
-        filename_upper: str = f.rfilename.upper()
-
-        for base_quant in QUANT_MULTIPLIERS.keys():
-            if base_quant in filename_upper:
-                size_variant: str = ""
-                if "_L" in filename_upper:
-                    size_variant = "_L"
-                elif "_M" in filename_upper:
-                    size_variant = "_M"
-                elif "_S" in filename_upper:
-                    size_variant = "_S"
-                elif "_XS" in filename_upper:
-                    size_variant = "_XS"
-                elif "_XXS" in filename_upper:
-                    size_variant = "_XXS"
-                quant_type = f"{base_quant}{size_variant}"
-                break
-
-        if quant_type and quant_type not in grouped:
-            grouped[quant_type] = {"size": 0.0, "files": []}
-        if quant_type:
-            grouped[quant_type]["size"] += f.size
-            grouped[quant_type]["files"].append(f)
-    return grouped
-
-
-def analyze_huggingface_url(repo_url: str) -> None:
-    if "huggingface.co/" not in repo_url:
-        console.print("[red]URL is not a valid Hugging Face model URL.[/red]")
-        return
-
-    repo_url = repo_url.rstrip("/")
-    parts: List[str] = repo_url.split("huggingface.co/")
-    path_part: str = parts[1]
-    repo_id: str = (
-        path_part.split("/tree/main/")[0]
-        if "/tree/main/" in path_part
-        else (
-            path_part.split("/blob/main/")[0]
-            if "/blob/main/" in path_part
-            else path_part
-        )
-    )
-
-    api: HfApi = HfApi()
+def get_local_files_for_repo(repo_id):
+    local_files = set()
     try:
-        api.model_info(repo_id)
-    except Exception:
-        console.print("\n[yellow]Model Not Found[/yellow]")
-        console.print(
-            "[red]The model you're looking for does not exist or it's not public.[/red]"
-        )
+        cache = scan_cache_dir()
+        for repo in cache.repos:
+            if repo.repo_id == repo_id:
+                for r in repo.revisions:
+                    for f in r.files:
+                        local_files.add(f.file_name)
+    except: pass
+    return local_files
+
+# --- Lógica de Agrupación (NUEVA) ---
+
+def consolidate_files(files):
+    """
+    Agrupa archivos partidos (shards) tipo 'model-00001-of-00005.gguf'
+    y filtra basura como 'imatrix'.
+    """
+    groups = {}
+    
+    for f in files:
+        fname = f.rfilename
+        
+        # 1. Ignorar archivos que no son modelos reales
+        if "imatrix" in fname.lower() or "mmproj" in fname.lower():
+            continue
+
+        # 2. Detectar patrón de Sharding (ej: -00001-of-00005)
+        # Regex busca: (cualquier_cosa) seguido de -Digitos-of-Digitos.gguf
+        shard_match = re.search(r"(.*)-\d{5}-of-\d{5}\.gguf", fname)
+        
+        if shard_match:
+            # Si es una parte, usamos el nombre base como clave
+            base_name = shard_match.group(1) + ".gguf (Split)"
+            display_name = base_name.split('/')[-1] # Limpiar rutas largas
+        else:
+            # Si es un archivo único
+            base_name = fname
+            display_name = fname.split('/')[-1]
+
+        if base_name not in groups:
+            groups[base_name] = {
+                'display_name': display_name,
+                'real_files': [],
+                'total_size': 0
+            }
+        
+        groups[base_name]['real_files'].append(fname)
+        groups[base_name]['total_size'] += f.size
+
+    return groups.values()
+
+# --- Análisis Principal ---
+
+def analyze_model(repo_id):
+    api = HfApi()
+    try:
+        model_info = api.model_info(repo_id, files_metadata=True)
+    except Exception as e:
+        console.print(f"[bold red]Error al contactar Hugging Face:[/bold red] {e}")
         return
 
-    viable_quants: List[Tuple[str, float, str]] = []
-    progress: Progress = Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-        transient=True,
-    )
+    ram_sys, vram_sys = get_system_memory()
+    local_files = get_local_files_for_repo(repo_id)
 
-    with progress:
-        progress.add_task("Analyzing system resources...", total=None)
-        ram_gb, vram_gb = get_system_memory()
+    # Filtrar solo GGUFs
+    raw_gguf_files = [f for f in model_info.siblings if f.rfilename.endswith(".gguf")]
 
-        if vram_gb == -1:
-            console.print(
-                "[red]CUDA is not available or not properly installed/configured on this system.[/red]\n"
-                "[red]If you already have CUDA installed, please ensure the following packages are compatible with the same CUDA version: torch, torchaudio, torchvision.[/red]\n"
-                "[red]If unsure, consider reinstalling PyTorch with the appropriate CUDA version using the official index: https://pytorch.org/get-started/locally/. [/red]"
-            )
-            return
+    if not raw_gguf_files:
+        console.print("[yellow]Este repositorio no contiene archivos GGUF.[/yellow]")
+        return
 
+    # Usar la nueva función para limpiar y sumar
+    consolidated_models = consolidate_files(raw_gguf_files)
 
-        if "/blob/main/" in path_part:
-            repo_id, file_path = path_part.split("/blob/main/", 1)
-            progress.add_task(f"Fetching info for {file_path}...", total=None)
-            model_info = api.model_info(repo_id, files_metadata=True)
-            all_files = model_info.siblings
+    # Tabla
+    table = Table(title=f"Análisis VRAM: {repo_id}")
+    table.add_column("Modelo / Quant", style="cyan")
+    table.add_column("Tamaño Total", justify="right")
+    table.add_column("VRAM Req (+Ctx)", justify="right", style="magenta")
+    table.add_column("Local", justify="center")
+    table.add_column("Estado Real")
 
-            target_file = next((f for f in all_files if f.rfilename == file_path), None)
-            if target_file:
-                file_size_gb: float = target_file.size / (1024**3)
-                estimated_ram_needed: float = estimate_ram_requirement(
-                    file_path, target_file.size
-                )
-                performance_label: str = get_performance_label(
-                    estimated_ram_needed, ram_gb, vram_gb
-                )
+    recommendation = None
+    best_score = -1
+    
+    # Convertir a lista y ordenar por tamaño
+    sorted_models = sorted(consolidated_models, key=lambda x: x['total_size'])
 
-                table: Table = Table(show_header=True, header_style="bold magenta")
-                table.add_column("Property", style="cyan")
-                table.add_column("Value", style="green")
+    for m in sorted_models:
+        size_gb = m['total_size'] / (1024**3)
+        req_vram = size_gb * 1.15  # 15% margen contexto
+        
+        # Verificar si TODAS las partes están en local
+        all_parts_local = all(f in local_files for f in m['real_files'])
+        local_icon = "✅" if all_parts_local else ""
 
-                table.add_row("File", file_path)
-                table.add_row("Size", f"{file_size_gb:.2f}GB")
-                table.add_row("RAM Available", f"{ram_gb:.2f}GB")
-                table.add_row("VRAM Available", f"{vram_gb:.2f}GB")
-                table.add_row("Performance", performance_label)
-
-                console.print(
-                    Panel(table, title="[bold]Model Analysis", border_style="green")
-                )
-                return
-
-        subfolder: Optional[str] = None
-        if "/tree/main/" in path_part:
-            repo_id, subfolder = path_part.split("/tree/main/", 1)
-
-        progress.add_task(f"Analyzing repository: {repo_id}...", total=None)
-        model_info = api.model_info(repo_id, files_metadata=True)
-        all_files = model_info.siblings
-
-        if "GGUF" in repo_id.upper():
-            gguf_files: List[Any] = [
-                f for f in all_files if f.rfilename.endswith(".gguf")
-            ]
-            if not gguf_files:
-                console.print("[red]No GGUF files found in repository[/red]")
-                return
-
-            grouped_files: Dict[str, Dict[str, Union[float, List[Any]]]] = (
-                group_split_files(gguf_files)
-            )
-
-            for quant_type, group in grouped_files.items():
-                file_size_gb: float = float(group["size"]) / (1024**3)
-                estimated_ram_needed: float = estimate_ram_requirement(
-                    quant_type, float(group["size"])
-                )
-                performance_label: str = get_performance_label(
-                    estimated_ram_needed, ram_gb, vram_gb
-                )
-
-                if "Too large" not in performance_label:
-                    viable_quants.append((quant_type, file_size_gb, performance_label))
-
-            viable_quants.sort(key=lambda x: x[1])
-
-            table: Table = Table(show_header=True, header_style="bold magenta")
-            table.add_column("Property", style="cyan")
-            table.add_column("Value", style="green")
-
-            table.add_row("RAM Available", f"{ram_gb:.2f}GB")
-            table.add_row("VRAM Available", f"{vram_gb:.2f}GB")
-
-        if viable_quants:
-            gpu_ready_quants: List[Tuple[str, float, str]] = [
-                (q, s, p) for q, s, p in viable_quants if "GPU-Ready" in p
-            ]
-            ready_quants: List[Tuple[str, float, str]] = [
-                (q, s, p)
-                for q, s, p in viable_quants
-                if "Ready" in p and "GPU-Ready" not in p
-            ]
-            slow_quants: List[Tuple[str, float, str]] = [
-                (q, s, p) for q, s, p in viable_quants if "Will be slow" in p
-            ]
-
-            recommended: str
-            if all("Will be slow" in p for _, _, p in viable_quants):
-                recommended = min(viable_quants, key=lambda x: x[1])[0]
-            else:
-                if gpu_ready_quants:
-                    recommended = max(gpu_ready_quants, key=lambda x: x[1])[0]
-                elif ready_quants:
-                    recommended = max(ready_quants, key=lambda x: x[1])[0]
-                else:
-                    recommended = min(slow_quants, key=lambda x: x[1])[0]
-
-            quants_display: List[str] = []
-            for quant, size, perf in viable_quants:
-                if "GPU-Ready" in perf:
-                    perf_display = f"[green]{perf.split('(')[0].strip()}[/green]"
-                elif "slow" in perf:
-                    perf_display = f"[yellow]{perf.split('(')[0].strip()}[/yellow]"
-                else:
-                    perf_display = f"[cyan]{perf.split('(')[0].strip()}[/cyan]"
-                quants_display.append(f"{quant} ({size:.1f}GB) - {perf_display}")
-
-            table.add_row("Viable Quantizations", "\n".join(quants_display))
-            table.add_row(
-                "Recommended Quantization", f"[bold blue]{recommended}[/bold blue]"
-            )
-
-            console.print(
-                Panel(table, title="[bold]Model Analysis", border_style="green")
-            )
+        # Estado
+        if vram_sys >= req_vram:
+            status = "[green]GPU (Rápido)[/green]"
+            score = size_gb + 100
+        elif (vram_sys + ram_sys) >= req_vram:
+            offload_pct = (vram_sys / req_vram) * 100
+            status = f"[yellow]Híbrido ({int(offload_pct)}% GPU)[/yellow]"
+            score = size_gb
         else:
-            extensions: List[str] = [".safetensors", ".bin"]
-            total_size_bytes: int = 0
+            status = "[red]No Cabe (Lento)[/red]"
+            score = -1
 
-            for f in all_files:
-                if any(f.rfilename.endswith(ext) for ext in extensions):
-                    if subfolder and not f.rfilename.startswith(subfolder):
-                        continue
-                    total_size_bytes += f.size
+        if score > best_score:
+            best_score = score
+            recommendation = m['display_name']
 
-            if total_size_bytes == 0:
-                console.print(
-                    f"[red]No model files ({', '.join(extensions)}) found in the specified repo/subfolder.[/red]"
-                )
-                return
+        table.add_row(
+            m['display_name'],
+            f"{size_gb:.2f} GB",
+            f"{req_vram:.2f} GB",
+            local_icon,
+            status
+        )
 
-            estimated_ram_needed: float = estimate_ram_requirement(
-                repo_id, total_size_bytes
-            )
-            performance_label: str = get_performance_label(
-                estimated_ram_needed, ram_gb, vram_gb
-            )
-            total_size_gb: float = total_size_bytes / (1024**3)
-
-            table: Table = Table(show_header=True, header_style="bold magenta")
-            table.add_column("Property", style="cyan")
-            table.add_column("Value", style="green")
-
-            table.add_row("Model Size", f"{total_size_gb:.2f}GB")
-            table.add_row("RAM Available", f"{ram_gb:.2f}GB")
-            table.add_row("VRAM Available", f"{vram_gb:.2f}GB")
-            table.add_row("Performance", performance_label)
-
-            console.print(
-                Panel(table, title="[bold]Model Analysis", border_style="green")
-            )
-
+    console.print(table)
+    
+    if recommendation:
+        console.print(Panel(
+            f"Mejor opción real para tu hardware: [bold blue]{recommendation}[/bold blue]",
+            title="🎯 Recomendación Inteligente", border_style="green"
+        ))
 
 if __name__ == "__main__":
-    console.print(
-        "\n[bold cyan]Enter a Hugging Face model URL (or 'exit' to quit):[/bold cyan]"
-    )
-    url: str = input().strip()
-
-    if url.lower() == "exit":
-        sys.exit()
-
-    if url:
-        console.print(f"\n[yellow]Analyzing:[/yellow] {url}")
-        analyze_huggingface_url(url)
-        console.print()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, required=True)
+    args = parser.parse_args()
+    repo = args.model.replace("https://huggingface.co/", "")
+    analyze_model(repo)
